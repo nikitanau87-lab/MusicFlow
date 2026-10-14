@@ -193,7 +193,7 @@ def test_upgrade_existing_database_and_restore_v01_copy(library):
     legacy_database(directory / "musicflow.sqlite3")
     upgraded = Database(directory)
     assert list((directory / "backups").glob("*-before-migration.sqlite3"))
-    assert Database.validate_backup(upgraded.path) == "0002"
+    assert Database.validate_backup(upgraded.path) == "0003"
     upgraded.engine.dispose()
 
 

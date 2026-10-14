@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import Project, now
+from .history import record
 
 DAW_EXTENSIONS = {".flp", ".als", ".logicx", ".rpp", ".band", ".song", ".cpr", ".ptx"}
 AUDIO_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aif": "audio/aiff", ".aiff": "audio/aiff", ".flac": "audio/flac", ".aac": "audio/aac"}
@@ -16,7 +17,7 @@ EXPORT_FOLDERS = {"exports", "export", "renders", "render", "bounces", "demos", 
 
 
 def inspect_folder(folder: str | None, daw: str | None, stop: threading.Event | None = None):
-    result = {"size": None, "count": 0, "partial": False, "unavailable": False, "last_worked_at": None, "audio": [], "error": None}
+    result = {"size": None, "count": 0, "partial": False, "unavailable": False, "last_worked_at": None, "daw_path": daw, "audio": [], "error": None}
     started = time.monotonic()
     latest_daw = None
     main_daw_time = None
@@ -59,6 +60,8 @@ def inspect_folder(folder: str | None, daw: str | None, stop: threading.Event | 
                         path = Path(entry.path)
                         stat = entry.stat(follow_symlinks=False)
                         if path.suffix.lower() in DAW_EXTENSIONS:
+                            if not daw and (latest_daw is None or stat.st_mtime > latest_daw):
+                                result["daw_path"] = str(path)
                             latest_daw = max(latest_daw or stat.st_mtime, stat.st_mtime)
                         if entry.is_dir(follow_symlinks=False):
                             directories.append(path)
@@ -140,6 +143,26 @@ class FolderScanner:
                 if project.preview_auto and not info["unavailable"]:
                     # A plain sample is listed for selection, but never guessed as a demo.
                     project.preview_path = next((item["path"] for item in info["audio"] if item["score"] > 0), None)
+                if not info["unavailable"]:
+                    current = {}
+                    for key, path in (("daw", info["daw_path"]), ("demo", project.preview_path)):
+                        if path:
+                            try:
+                                stat = Path(path).stat()
+                                if stat.st_mtime >= 0:
+                                    current[key] = {"path": path, "mtime": stat.st_mtime, "size": stat.st_size}
+                            except OSError:
+                                pass
+                    before = project.file_history_state
+                    if before is not None:
+                        for key, value in current.items():
+                            previous = before.get(key)
+                            if previous != value:
+                                label = "Обнаружено сохранение DAW" if key == "daw" else "Обнаружена новая или обновлённая демка"
+                                timestamp = min(datetime.fromtimestamp(value["mtime"], timezone.utc), now())
+                                record(project, "daw_saved" if key == "daw" else "demo_updated", f"{label}: {Path(value['path']).name}", {"file": value["path"], "mtime": value["mtime"], "source": "file_observation"}, occurred_at=timestamp)
+                    # Missing files keep their previous baseline until they reappear.
+                    project.file_history_state = {**(before or {}), **current}
                 db.commit()
             with self._guard:
                 if self._jobs.get(project_id) is job:

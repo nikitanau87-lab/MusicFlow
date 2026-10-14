@@ -1,7 +1,7 @@
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from .database import Database
-from .models import Collection, Project, Task, now
+from .models import ActivityEvent, Collection, Project, Task, now
+from .history import FIELD_LABELS, STAGE_LABELS, record, utc_naive
 from .files import AUDIO_TYPES, DAW_EXTENSIONS, FolderScanner
 
 Stage = Literal["idea", "working", "mixing", "mastering", "done"]
@@ -106,6 +107,21 @@ class TaskOrder(Input):
     ids: list[int]
 
 
+class WorkEntry(Input):
+    summary: str = Field(min_length=1, max_length=5000)
+    occurred_at: datetime
+    duration_minutes: int | None = Field(default=None, gt=0, le=1440, strict=True)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def actual_date(cls, value):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Укажите дату с часовым поясом.")
+        if value > now():
+            raise ValueError("Запись о работе не может относиться к будущему.")
+        return utc_naive(value)
+
+
 def date(value):
     return value.isoformat(timespec="seconds").replace("+00:00", "Z") + ("Z" if value.tzinfo is None else "")
 
@@ -130,6 +146,11 @@ def serialize(project):
     }
 
 
+def serialize_event(item):
+    return {"id": item.id, "kind": item.kind, "summary": item.summary, "details": item.details,
+            "occurred_at": date(item.occurred_at), "recorded_at": date(item.recorded_at), "duration_minutes": item.duration_minutes}
+
+
 def create_app(database: Database, token: str, assets: Path | None = None):
     scanner = FolderScanner(database)
     media_token = secrets.token_urlsafe(32)
@@ -144,7 +165,9 @@ def create_app(database: Database, token: str, assets: Path | None = None):
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_, error):
-        return JSONResponse(status_code=422, content={"detail": "Проверьте поля: название обязательно, BPM должен быть положительным числом, поля не должны превышать допустимую длину."})
+        messages = [str(item.get("ctx", {}).get("error", "")) for item in error.errors()]
+        specific = next((message for message in messages if message), None)
+        return JSONResponse(status_code=422, content={"detail": specific or "Проверьте поля: название и описание обязательны, BPM и длительность должны быть положительными числами, поля не должны превышать допустимую длину."})
 
     @app.exception_handler(Exception)
     async def unexpected_error(_, error):
@@ -277,6 +300,7 @@ def create_app(database: Database, token: str, assets: Path | None = None):
         identifiers = fields.pop("collection_ids")
         project = Project(**fields, collections=collections_for(db, identifiers))
         db.add(project)
+        record(project, "project_created", "Создан проект")
         db.commit()
         return serialize(project)
 
@@ -288,22 +312,85 @@ def create_app(database: Database, token: str, assets: Path | None = None):
     def edit_project(identifier: int, payload: ProjectPatch, db: DB):
         project = get_project(db, identifier)
         fields = payload.model_dump(exclude_unset=True)
+        changes = {}
         if "collection_ids" in fields:
-            project.collections = collections_for(db, fields.pop("collection_ids"))
+            groups = collections_for(db, fields.pop("collection_ids"))
+            before = sorted(item.name for item in project.collections)
+            after = sorted(item.name for item in groups)
+            if before != after:
+                changes["collections"] = {"before": before, "after": after}
+                project.collections = groups
+        fields = {key: value for key, value in fields.items() if getattr(project, key) != value}
         if "folder_path" in fields or "daw_path" in fields:
             project.folder_size_bytes = None
             project.folder_scanned_at = None
             project.last_worked_at = None
             project.folder_unavailable = False
+            project.file_history_state = None
+        elif "preview_path" in fields or "preview_auto" in fields:
+            project.file_history_state = None
         for field, value in fields.items():
+            old = getattr(project, field)
+            if field == "status":
+                record(project, "status_changed", f"Стадия: {STAGE_LABELS[old]} → {STAGE_LABELS[value]}", {"before": old, "after": value})
+            elif field == "archived":
+                record(project, "archived" if value else "restored", "Проект отправлен в архив" if value else "Проект возвращён из архива")
+            else:
+                changes[field] = {"before": old[:1000] if isinstance(old, str) else old, "after": value[:1000] if isinstance(value, str) else value}
             setattr(project, field, value)
-        project.updated_at = now()
+        if changes:
+            record(project, "project_updated", "Изменены: " + ", ".join(FIELD_LABELS[key] for key in changes), {"changes": changes})
+        if fields or changes:
+            project.updated_at = now()
         db.commit()
         return serialize(project)
 
     @router.delete("/projects/{identifier}", status_code=204)
     def delete_project(identifier: int, db: DB):
         db.delete(get_project(db, identifier))
+        db.commit()
+
+    @router.get("/projects/{identifier}/history")
+    def history(identifier: int, since: datetime, until: datetime, db: DB):
+        get_project(db, identifier)
+        if since.tzinfo is None or until.tzinfo is None:
+            raise HTTPException(422, "Укажите часовой пояс периода.")
+        start, end = utc_naive(since), utc_naive(until)
+        if not 0 < (end - start).total_seconds() <= 32 * 86400:
+            raise HTTPException(422, "Выберите период не более 32 дней.")
+        items = list(db.scalars(select(ActivityEvent).where(ActivityEvent.project_id == identifier, ActivityEvent.occurred_at >= start, ActivityEvent.occurred_at < end).order_by(ActivityEvent.occurred_at.desc(), ActivityEvent.id.desc()).limit(5001)))
+        return {"events": [serialize_event(item) for item in items[:5000]], "truncated": len(items) > 5000}
+
+    @router.post("/projects/{identifier}/history", status_code=201)
+    def add_work(identifier: int, payload: WorkEntry, db: DB):
+        project = get_project(db, identifier)
+        item = record(project, "manual", payload.summary, occurred_at=payload.occurred_at, duration=payload.duration_minutes)
+        project.updated_at = now()
+        db.commit()
+        return serialize_event(item)
+
+    def manual_event(db, identifier, event_id):
+        get_project(db, identifier)
+        item = db.get(ActivityEvent, event_id)
+        if item is None or item.project_id != identifier:
+            raise HTTPException(404, "Запись не найдена.")
+        if item.kind != "manual":
+            raise HTTPException(403, "Автоматические события нельзя редактировать.")
+        return item
+
+    @router.put("/projects/{identifier}/history/{event_id}")
+    def edit_work(identifier: int, event_id: int, payload: WorkEntry, db: DB):
+        item = manual_event(db, identifier, event_id)
+        item.summary, item.occurred_at, item.duration_minutes = payload.summary, payload.occurred_at, payload.duration_minutes
+        item.project.updated_at = now()
+        db.commit()
+        return serialize_event(item)
+
+    @router.delete("/projects/{identifier}/history/{event_id}", status_code=204)
+    def delete_work(identifier: int, event_id: int, db: DB):
+        item = manual_event(db, identifier, event_id)
+        item.project.updated_at = now()
+        db.delete(item)
         db.commit()
 
     @router.get("/projects/{identifier}/tasks")
@@ -314,6 +401,7 @@ def create_app(database: Database, token: str, assets: Path | None = None):
     def add_task(identifier: int, payload: TaskCreate, db: DB):
         project = get_project(db, identifier)
         project.tasks.append(Task(title=payload.title, position=len(project.tasks)))
+        record(project, "task_added", f"Добавлена задача «{payload.title}»")
         project.updated_at = now()
         db.commit()
         return serialize(project)
@@ -325,6 +413,7 @@ def create_app(database: Database, token: str, assets: Path | None = None):
         for title in ("Написать бит", "Записать вокал", "Свести трек", "Сделать мастеринг"):
             if title.casefold() not in existing:
                 project.tasks.append(Task(title=title, position=len(project.tasks)))
+                record(project, "task_added", f"Добавлена задача «{title}»")
         project.updated_at = now()
         db.commit()
         return serialize(project)
@@ -335,6 +424,8 @@ def create_app(database: Database, token: str, assets: Path | None = None):
         if len(payload.ids) != len(project.tasks) or set(payload.ids) != {task.id for task in project.tasks}:
             raise HTTPException(422, "Новый порядок должен содержать каждую задачу ровно один раз.")
         positions = {task_id: position for position, task_id in enumerate(payload.ids)}
+        if any(task.position != positions[task.id] for task in project.tasks):
+            record(project, "tasks_reordered", "Изменён порядок задач")
         for task in project.tasks:
             task.position = positions[task.id]
         project.updated_at = now()
@@ -346,6 +437,12 @@ def create_app(database: Database, token: str, assets: Path | None = None):
         project = get_project(db, identifier)
         task = get_task(project, task_id)
         for field, value in payload.model_dump(exclude_unset=True).items():
+            if getattr(task, field) == value:
+                continue
+            if field == "completed":
+                record(project, "task_completed" if value else "task_reopened", f"{'Выполнена задача' if value else 'Возвращена в работу задача'} «{task.title}»")
+            else:
+                record(project, "task_updated", f"Переименована задача «{task.title}» → «{value}»")
             setattr(task, field, value)
         project.updated_at = now()
         db.commit()
@@ -354,7 +451,9 @@ def create_app(database: Database, token: str, assets: Path | None = None):
     @router.delete("/projects/{identifier}/tasks/{task_id}")
     def delete_task(identifier: int, task_id: int, db: DB):
         project = get_project(db, identifier)
-        project.tasks.remove(get_task(project, task_id))
+        task = get_task(project, task_id)
+        record(project, "task_deleted", f"Удалена задача «{task.title}»")
+        project.tasks.remove(task)
         for position, task in enumerate(sorted(project.tasks, key=lambda t: t.position)):
             task.position = position
         project.updated_at = now()

@@ -22,7 +22,7 @@ class MusicFlowBuild(py2app):
 
 setup(
     name="MusicFlow",
-    version="0.2.0",
+    version="0.3.0",
     app=["desktop.py"],
     cmdclass={"py2app": MusicFlowBuild},
     options={"py2app": {

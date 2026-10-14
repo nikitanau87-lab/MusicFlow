@@ -3,11 +3,12 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { stages } from './types';
-import type { Collection, Project } from './types';
+import type { ActivityEvent, Collection, Project } from './types';
 
 const api = vi.hoisted(() => ({ request: vi.fn(), native: vi.fn(), ensureMediaSession: vi.fn().mockResolvedValue({ready:true}) }));
 vi.mock('./api', () => api);
 let projects: Project[];
+let eventsData: ActivityEvent[];
 let collectionsData: Collection[];
 
 function project(id: number, title: string): Project {
@@ -15,7 +16,7 @@ function project(id: number, title: string): Project {
 }
 
 beforeEach(() => {
-  projects = [];
+  projects = []; eventsData = [];
   collectionsData = [];
   api.request.mockReset(); api.native.mockReset(); api.native.mockResolvedValue({ ok: true });
   api.request.mockImplementation(async (path: string, options: RequestInit = {}) => {
@@ -35,6 +36,13 @@ beforeEach(() => {
     }
     const id = Number(path.split('/')[2]);
     const item = projects.find(p => p.id === id)!;
+    if(path.includes('/history')) {
+      if(!options.method) {const params=new URLSearchParams(path.split('?')[1]); return {events:structuredClone(eventsData.filter(event=>new Date(event.occurred_at)>=new Date(params.get('since')!)&&new Date(event.occurred_at)<new Date(params.get('until')!))),truncated:false};}
+      if(options.method==='DELETE') {eventsData=eventsData.filter(event=>event.id!==Number(path.split('/')[4]));return;}
+      const body=JSON.parse(options.body as string);
+      if(options.method==='PUT') {const event=eventsData.find(event=>event.id===Number(path.split('/')[4]))!;Object.assign(event,body);return structuredClone(event);}
+      const event={id:eventsData.length+1,kind:'manual',details:{},recorded_at:new Date().toISOString(),...body};eventsData.push(event);return structuredClone(event);
+    }
     if(path.endsWith('/folder-info') || path.includes('/folder-info?')) return {state:'empty', audio:[], error:null, project:structuredClone(item)};
     if (options.method === 'PATCH') Object.assign(item, JSON.parse(options.body as string));
     return structuredClone(item);
@@ -48,9 +56,10 @@ describe('MusicFlow interaction', () => {
     const dialog = screen.getByRole('dialog', { name: 'Новый проект' });
     await user.type(within(dialog).getByPlaceholderText('Как назовём новый трек?'), 'Ночной трек');
     await user.click(within(dialog).getByRole('button', { name: 'Создать проект' }));
-    expect(await screen.findByRole('button', { name: 'Открыть проект: Ночной трек' })).toBeTruthy();
-    expect(screen.getByRole('complementary', { name: 'Карточка проекта' })).toBeTruthy();
-    expect(screen.getByText('Нет задач')).toBeTruthy();
+    expect(await screen.findByRole('region', {name:'Страница проекта'})).toBeTruthy();
+    expect(screen.queryByRole('button',{name:'Открыть проект: Ночной трек'})).toBeNull();
+    await user.click(screen.getByRole('tab',{name:'Задачи'}));
+    expect(screen.getByRole('button',{name:'Добавить типовые задачи'})).toBeTruthy();
   });
 
   it('protects unsaved edits and saves a manual stage independently of tasks', async () => {
@@ -58,15 +67,16 @@ describe('MusicFlow interaction', () => {
     await user.click(await screen.findByRole('button', { name: 'Открыть проект: Тест' }));
     const title = screen.getByLabelText('Название трека');
     await user.clear(title); await user.type(title, 'Изменённый');
-    await user.click(screen.getByRole('button', { name: 'Закрыть карточку' }));
+    await user.click(screen.getByRole('button', { name: 'Назад к проектам' }));
     expect(screen.getByRole('dialog', { name: 'Есть несохранённые изменения' })).toBeTruthy();
     await user.click(screen.getByRole('button', { name: 'Вернуться к проекту' }));
     await user.selectOptions(screen.getByLabelText('Стадия'), 'done');
     await user.click(screen.getByRole('button', { name: 'Сохранить' }));
     await waitFor(() => expect(projects[0].title).toBe('Изменённый'));
     expect(projects[0].status).toBe('done'); expect(projects[0].task_count).toBe(0);
-    expect(await screen.findByRole('button', { name: 'Открыть проект: Изменённый' })).toBeTruthy();
-    await user.click(screen.getByRole('button', { name: 'Закрыть карточку' }));
+    expect(screen.getByRole('heading',{name:'Изменённый'})).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Назад к проектам' }));
+    expect(await screen.findByRole('button',{name:'Открыть проект: Изменённый'})).toBeTruthy();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
@@ -112,7 +122,7 @@ describe('MusicFlow interaction', () => {
     await user.click(screen.getByRole('button',{name:'Сохранить'}));
     await waitFor(() => expect(projects[0].tags).toEqual(['ночной']));
     expect(projects[0].collection_ids).toEqual([5]);
-    await user.click(screen.getByRole('button',{name:'Закрыть карточку'}));
+    await user.click(screen.getByRole('button',{name:'Назад к проектам'}));
     await user.selectOptions(screen.getByLabelText('Фильтр по тегу'),'ночной');
     expect(await screen.findByRole('button',{name:'Открыть проект: Ночь'})).toBeTruthy();
   });
@@ -161,5 +171,72 @@ describe('MusicFlow interaction', () => {
     expect(screen.getByRole('button',{name:'Пауза демки'})).toBeTruthy();
     fireEvent.pause(media);
     expect(screen.getByRole('button',{name:'Воспроизвести демку'})).toBeTruthy();
+  });
+  it('opens a full page and returns to the same filtered library and scroll position', async () => {
+    projects=[project(1,'Ночь'),project(2,'Утро')];const user=userEvent.setup();render(<App/>);
+    await user.type(await screen.findByLabelText('Поиск проектов'),'Ночь');
+    await waitFor(()=>expect(screen.queryByRole('button',{name:'Открыть проект: Утро'})).toBeNull());
+    screen.getByRole('main').scrollTop=240;
+    await user.click(screen.getByRole('button',{name:'Открыть проект: Ночь'}));
+    expect(screen.queryByRole('main')).toBeNull();
+    await user.type(screen.getByLabelText('Название трека'),' — демка');
+    await user.click(screen.getByRole('tab',{name:'Задачи'}));
+    await user.click(screen.getByRole('tab',{name:'Обзор'}));
+    expect((screen.getByLabelText('Название трека') as HTMLInputElement).value).toBe('Ночь — демка');
+    await user.click(screen.getByRole('button',{name:'Сохранить'}));
+    await waitFor(()=>expect(projects[0].title).toBe('Ночь — демка'));
+    await user.click(screen.getByRole('button',{name:'Назад к проектам'}));
+    expect((screen.getByLabelText('Поиск проектов') as HTMLInputElement).value).toBe('Ночь');
+    expect(screen.getByRole('main').scrollTop).toBe(240);
+  });
+
+  it('selects calendar days and navigates months without retaining old events', async () => {
+    projects=[project(1,'Трек')];const now=new Date();
+    eventsData=[{id:1,kind:'task_completed',summary:'Выполнена задача «Вокал»',details:{},duration_minutes:null,occurred_at:now.toISOString(),recorded_at:now.toISOString()}];
+    const user=userEvent.setup();render(<App/>);
+    await user.click(await screen.findByRole('button',{name:'Открыть проект: Трек'}));
+    await user.click(screen.getByRole('tab',{name:'История'}));
+    expect(await screen.findByText('Выполнена задача «Вокал»')).toBeTruthy();
+    const label=now.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
+    expect(screen.getByRole('button',{name:`${label}, событий: 1`}).getAttribute('aria-pressed')).toBe('true');
+    await user.click(screen.getByRole('button',{name:'Весь месяц'}));
+    await user.click(screen.getByRole('button',{name:'Предыдущий месяц'}));
+    await waitFor(()=>expect(screen.queryByText('Выполнена задача «Вокал»')).toBeNull());
+    await user.click(screen.getByRole('button',{name:'Сегодня'}));
+    expect(await screen.findByText('Выполнена задача «Вокал»')).toBeTruthy();
+  });
+
+  it('protects an unfinished work entry and saves its date and duration', async () => {
+    projects=[project(1,'Трек')];const user=userEvent.setup();render(<App/>);
+    await user.click(await screen.findByRole('button',{name:'Открыть проект: Трек'}));
+    await user.click(screen.getByRole('tab',{name:'История'}));
+    await user.click(screen.getByRole('button',{name:'Записать результат работы'}));
+    await user.type(screen.getByLabelText('Описание работы'),'Перезаписал припев');
+    await user.type(screen.getByLabelText('Длительность, минут · необязательно'),'45');
+    expect(window.musicflowUnsaved).toBe(true);
+    await user.click(screen.getByRole('button',{name:'Отмена'}));
+    expect(screen.getByRole('dialog',{name:'Не сохранять запись?'})).toBeTruthy();
+    await user.click(screen.getByRole('button',{name:'Продолжить запись'}));
+    await user.click(screen.getByRole('button',{name:'Сохранить запись'}));
+    await waitFor(()=>expect(eventsData[0].summary).toBe('Перезаписал припев'));
+    expect(eventsData[0].duration_minutes).toBe(45);
+    expect(await screen.findByText('Перезаписал припев')).toBeTruthy();
+    await waitFor(()=>expect(window.musicflowUnsaved).toBe(false));
+  });
+
+  it('edits a manual entry and confirms before removing it', async () => {
+    projects=[project(1,'Трек')];const now=new Date();
+    eventsData=[{id:1,kind:'manual',summary:'Бит готов',details:{},duration_minutes:30,occurred_at:now.toISOString(),recorded_at:now.toISOString()}];
+    const user=userEvent.setup();render(<App/>);
+    await user.click(await screen.findByRole('button',{name:'Открыть проект: Трек'}));
+    await user.click(screen.getByRole('tab',{name:'История'}));
+    await user.click(await screen.findByRole('button',{name:'Изменить запись'}));
+    await user.clear(screen.getByLabelText('Описание работы'));await user.type(screen.getByLabelText('Описание работы'),'Бит и вокал готовы');
+    await user.click(screen.getByRole('button',{name:'Сохранить запись'}));
+    expect(await screen.findByText('Бит и вокал готовы')).toBeTruthy();
+    await user.click(screen.getByRole('button',{name:'Удалить запись'}));
+    expect(eventsData).toHaveLength(1);
+    await user.click(within(screen.getByRole('dialog',{name:'Удалить запись о работе?'})).getByRole('button',{name:'Удалить запись'}));
+    await waitFor(()=>expect(eventsData).toHaveLength(0));
   });
 });

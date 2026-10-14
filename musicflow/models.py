@@ -53,11 +53,13 @@ class Project(Base):
     folder_scan_partial: Mapped[bool] = mapped_column(Boolean, default=False)
     folder_unavailable: Mapped[bool] = mapped_column(Boolean, default=False)
     last_worked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    file_history_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     tasks: Mapped[list["Task"]] = relationship(back_populates="project", cascade="all, delete-orphan", order_by="Task.position")
     collections: Mapped[list[Collection]] = relationship(secondary=project_collections, back_populates="projects", order_by="Collection.name")
+    events: Mapped[list["ActivityEvent"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class Task(Base):
@@ -69,3 +71,20 @@ class Task(Base):
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
     position: Mapped[int] = mapped_column(Integer)
     project: Mapped[Project] = relationship(back_populates="tasks")
+
+
+EVENT_KINDS = ("project_created", "project_updated", "status_changed", "archived", "restored", "task_added", "task_completed", "task_reopened", "task_updated", "task_deleted", "tasks_reordered", "daw_saved", "demo_updated", "manual")
+
+
+class ActivityEvent(Base):
+    __tablename__ = "activity_events"
+    __table_args__ = (CheckConstraint("duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes <= 1440)"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    kind: Mapped[str] = mapped_column(String(30))
+    summary: Mapped[str] = mapped_column(Text)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    project: Mapped[Project] = relationship(back_populates="events")

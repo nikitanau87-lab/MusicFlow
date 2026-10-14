@@ -1,3 +1,4 @@
+import ProjectHistory from './ProjectHistory';
 import { useEffect, useRef, useState } from 'react';
 import { Archive, ArchiveRestore, ArrowDown, ArrowLeft, ArrowUp, Check, CheckCheck, ExternalLink, Folder, FolderOpen, Plus, Save, Trash2, X, Pencil, FileText, Tags, FolderHeart, RefreshCw, Play, Music2 } from 'lucide-react';
 import { native, request } from './api';
@@ -23,6 +24,8 @@ function TaskRow({ task, index, total, busy, modify, move, remove, editingChange
 }
 
 export default function Editor({ project, collections, knownTags, busy, changed, run, dirtyChanged, close, remove }: Props) {
+  const [tab, setTab] = useState<'overview'|'tasks'|'history'>('overview');
+  const [historyDirty, setHistoryDirty] = useState(false);
   const [draft, setDraft] = useState(() => draftFor(project));
   const [newTask, setNewTask] = useState('');
   const [folderError, setFolderError] = useState(false);
@@ -75,7 +78,7 @@ export default function Editor({ project, collections, knownTags, busy, changed,
     setDraft(current => ({...current, tags})); setTagText(''); setTagError('');
   };
   const dirty = JSON.stringify(draft) !== JSON.stringify(draftFor(project));
-  useEffect(() => { dirtyChanged(dirty || Boolean(tagText.trim()) || Boolean(newTask.trim()) || Object.values(editingTasks).some(Boolean)); }, [dirty, tagText, newTask, editingTasks, dirtyChanged]);
+  useEffect(() => { dirtyChanged(historyDirty || dirty || Boolean(tagText.trim()) || Boolean(newTask.trim()) || Object.values(editingTasks).some(Boolean)); }, [historyDirty, dirty, tagText, newTask, editingTasks, dirtyChanged]);
   const field = <K extends keyof typeof draft>(name: K, value: typeof draft[K]) => setDraft(current => ({ ...current, [name]: value }));
   const mutate = (path: string, method: string, data?: object) => run(async () => changed(await request<Project>(`/projects/${project.id}${path}`, { method, body: data ? JSON.stringify(data) : undefined })));
   const save = () => run(async () => {
@@ -101,11 +104,13 @@ export default function Editor({ project, collections, knownTags, busy, changed,
     mutate('/tasks/order', 'PUT', { ids });
   };
   const dateLabel = new Date(project.created_at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
-  return <aside className="editor" aria-label="Карточка проекта">
-    <header className="editor-header"><button className="icon-button" onClick={close} aria-label="Закрыть карточку"><ArrowLeft size={18} /></button><span>КАРТОЧКА ПРОЕКТА</span><StageBadge stage={project.status} /></header>
-    <div className="editor-scroll">
+  return <section className="editor project-page" aria-label="Страница проекта">
+    <header className="editor-header"><button className="icon-button" onClick={close} aria-label="Назад к проектам"><ArrowLeft size={18} /><span>К проектам</span></button><span>ПРОЕКТ</span><StageBadge stage={project.status} /></header>
+    <div className="editor-scroll project-page-scroll">
       <div className="editor-title"><div className={`track-art art-${project.status}`}><span>{project.title.slice(0, 1).toUpperCase()}</span><i /></div><div><h2 title={project.title}>{project.title}</h2><p>Создан {dateLabel}</p></div></div>
       {project.archived && <div className="inline-note"><Archive size={16} />Этот проект находится в архиве</div>}
+      <div className="project-tabs" role="tablist" aria-label="Разделы проекта">{([['overview','Обзор'],['tasks','Задачи'],['history','История']] as const).map(([key,label]) => <button type="button" key={key} id={`tab-${key}`} role="tab" aria-selected={tab===key} aria-controls={`panel-${key}`} tabIndex={tab===key ? 0 : -1} onClick={()=>setTab(key)} onKeyDown={event=>{if(event.key==='ArrowLeft'||event.key==='ArrowRight') {event.preventDefault();const values=['overview','tasks','history'] as const;const index=values.indexOf(tab);const next=values[(index+(event.key==='ArrowRight'?1:2))%3];setTab(next);requestAnimationFrame(()=>document.getElementById(`tab-${next}`)?.focus());}}}>{label}</button>)}</div>
+      <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" className="project-overview" hidden={tab!=='overview'}>
       <AudioPreview project={project} info={folderInfo} busy={busy} change={changePreview} choose={choosePreview} />
       <form id="project-form" onSubmit={e => { e.preventDefault(); save(); }}>
         <label>Название трека<input value={draft.title} onChange={e => field('title', e.target.value)} required maxLength={200} disabled={busy} /></label>
@@ -116,14 +121,16 @@ export default function Editor({ project, collections, knownTags, busy, changed,
         <section className="editor-section"><h3><Folder size={16} />Папка проекта</h3>{draft.folder_path ? <div className={`folder-card ${folderError ? 'folder-missing' : ''}`}><FolderOpen size={18} /><span title={draft.folder_path}>{draft.folder_path}</span><button type="button" className="icon-button" aria-label="Убрать ссылку на папку" disabled={busy} onClick={() => field('folder_path', '')}><X size={14} /></button></div> : <p className="section-hint">Свяжите трек с папкой вашего DAW-проекта.</p>}<div className="folder-actions"><button type="button" className="button subtle small" disabled={busy} onClick={chooseFolder}><Folder size={14} />{draft.folder_path ? 'Выбрать другую' : 'Выбрать папку'}</button>{project.folder_path && project.folder_path === draft.folder_path && <button type="button" className="button subtle small" disabled={busy} onClick={() => run(async () => { try { await native('open_project_folder', project.id); setFolderError(false); } catch (error) { setFolderError(true); throw error; } })}><ExternalLink size={14} />В Finder</button>}</div>{draft.folder_path !== (project.folder_path ?? '') && <p className="section-hint">Сохраните изменения, чтобы привязать папку.</p>}{folderError && <p className="field-error">Папка недоступна. Выберите её заново.</p>}{project.folder_path === draft.folder_path && project.folder_path && <><div className="folder-stats"><div><span>Размер папки</span><strong>{project.folder_unavailable ? 'Недоступна' : `${project.folder_scan_partial ? '≥ ' : ''}${formatSize(project.folder_size_bytes)}`}</strong><small>{project.folder_file_count !== null ? `${project.folder_file_count} файлов` : 'Ожидает проверки'}</small></div><div><span>Последняя работа</span><strong>{workedDate(project.last_worked_at)}</strong><small>По сохранению файла DAW</small></div></div><button type="button" className="template-button" disabled={folderInfo?.state === 'pending'} onClick={() => setScanRevision(current => current+1)}><RefreshCw size={13} className={folderInfo?.state === 'pending' ? 'spin' : ''} />{folderInfo?.state === 'pending' ? 'Проверяем файлы…' : 'Обновить размер и поиск демки'}</button>{(scanError || folderInfo?.error) && <p className="section-hint scan-note">{scanError || folderInfo?.error}</p>}</>}</section>
         <section className="editor-section"><h3><FileText size={16} />Заметки</h3><textarea rows={4} value={draft.notes} maxLength={100000} onChange={e => field('notes', e.target.value)} placeholder="Идея, референсы или то, что стоит попробовать…" disabled={busy} /></section>
       </form>
-      <section className="editor-section task-section"><div className="section-heading"><h3><CheckCheck size={17} />Задачи <span className="count-pill">{project.task_count}</span></h3><span className="muted small-text">{project.completed_tasks} выполнено</span></div>{project.task_count > 0 && <Progress project={project} />}
+      </div>
+      <section id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden={tab!=='tasks'} className="editor-section task-section"><div className="section-heading"><h3><CheckCheck size={17} />Задачи <span className="count-pill">{project.task_count}</span></h3><span className="muted small-text">{project.completed_tasks} выполнено</span></div>{project.task_count > 0 && <Progress project={project} />}
         <div className="task-list">{project.tasks.map((task, index) => <TaskRow key={task.id} task={task} index={index} total={project.tasks.length} busy={busy} modify={data => mutate(`/tasks/${task.id}`, 'PATCH', data)} move={offset => moveTask(index, offset)} remove={() => mutate(`/tasks/${task.id}`, 'DELETE')} editingChanged={value => setEditingTasks(current => ({...current, [task.id]: value}))} />)}</div>
         {!project.task_count && <p className="section-hint">Разбейте трек на небольшие шаги.</p>}
         <form className="add-task" onSubmit={async e => { e.preventDefault(); if (newTask.trim() && await mutate('/tasks', 'POST', { title: newTask.trim() })) setNewTask(''); }}><input aria-label="Новая задача" placeholder="Добавить задачу…" value={newTask} onChange={e => setNewTask(e.target.value)} maxLength={300} disabled={busy} /><button className="icon-button" disabled={busy || !newTask.trim()} aria-label="Добавить задачу"><Plus size={18} /></button></form>
         <button className="template-button" disabled={busy} onClick={() => mutate('/tasks/template', 'POST')}><Plus size={14} />Добавить типовые задачи</button>
       </section>
+      <div id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden={tab!=='history'}><ProjectHistory project={project} active={tab==='history'} busy={busy} run={run} dirtyChanged={setHistoryDirty} changed={changed} /></div>
       <div className="project-actions"><button className="button subtle small" disabled={busy} onClick={() => mutate('', 'PATCH', { archived: !project.archived })}>{project.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}{project.archived ? 'Вернуть из архива' : 'В архив'}</button><button className="icon-button danger-hover" disabled={busy} onClick={remove} title="Удалить проект" aria-label="Удалить проект"><Trash2 size={16} /></button></div>
     </div>
     <footer className="editor-footer"><span>{busy ? 'Сохраняем…' : dirty || tagText.trim() ? 'Есть несохранённые изменения' : newTask.trim() ? 'Добавьте новую задачу кнопкой +' : Object.values(editingTasks).some(Boolean) ? 'Завершите редактирование задачи' : 'Все изменения сохранены'}</span><button form="project-form" type="submit" className="button primary small" disabled={busy || (!dirty && !tagText.trim())}><Save size={15} />Сохранить</button></footer>
-  </aside>;
+  </section>;
 }

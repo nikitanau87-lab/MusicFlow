@@ -11,9 +11,9 @@ from alembic.config import Config
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
-from .models import Base, STAGES
+from .models import Base, STAGES, EVENT_KINDS
 
-REVISION = "0002"
+REVISION = "0003"
 LEGACY_PROJECT_COLUMNS = {"id", "title", "bpm", "musical_key", "genre", "status", "notes", "folder_path", "archived", "created_at", "updated_at"}
 
 
@@ -97,10 +97,10 @@ class Database:
                 if any(kind in {"view", "trigger"} for _, kind in objects) or "alembic_version" not in tables:
                     raise ValueError("Этот файл не является резервной копией MusicFlow.")
                 revisions = connection.execute("SELECT version_num FROM alembic_version").fetchall()
-                if revisions not in [[("0001",)], [(REVISION,)]]:
+                if revisions not in [[("0001",)], [("0002",)], [(REVISION,)]]:
                     raise ValueError("Версия резервной копии не поддерживается этой версией MusicFlow.")
                 revision = revisions[0][0]
-                expected_tables = {"projects", "tasks", "alembic_version"} if revision == "0001" else set(Base.metadata.tables) | {"alembic_version"}
+                expected_tables = {"projects", "tasks", "alembic_version"} if revision == "0001" else (set(Base.metadata.tables) - ({"activity_events"} if revision == "0002" else set())) | {"alembic_version"}
                 if tables != expected_tables:
                     raise ValueError("Этот файл не является резервной копией MusicFlow.")
                 for table in Base.metadata.sorted_tables:
@@ -108,6 +108,8 @@ class Database:
                         continue
                     columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table.name})")}
                     expected = LEGACY_PROJECT_COLUMNS if table.name == "projects" and revision == "0001" else set(table.columns.keys())
+                    if table.name == "projects" and revision == "0002":
+                        expected = expected - {"file_history_state"}
                     if columns != expected:
                         raise ValueError("Структура резервной копии не соответствует MusicFlow.")
                 if connection.execute("PRAGMA foreign_key_check").fetchall():
@@ -123,7 +125,7 @@ class Database:
                     if not isinstance(row["notes"], str) or len(row["notes"]) > 100000:
                         raise ValueError("В резервной копии некорректные заметки.")
                     optional_fields = [("musical_key", 40), ("genre", 100), ("folder_path", 4096)]
-                    if revision == REVISION:
+                    if revision != "0001":
                         optional_fields.extend((("daw_path", 4096), ("preview_path", 4096)))
                         tags = json.loads(row["tags"])
                         if not isinstance(tags, list) or len(tags) > 30 or any(not isinstance(tag, str) or not tag.strip() or len(tag) > 48 for tag in tags) or len({tag.casefold() for tag in tags}) != len(tags):
@@ -156,7 +158,7 @@ class Database:
                     positions.setdefault(row["project_id"], []).append(row["position"])
                 if any(sorted(values) != list(range(len(values))) for values in positions.values()):
                     raise ValueError("В резервной копии некорректный порядок задач.")
-                if revision == REVISION:
+                if revision != "0001":
                     collection_ids = set()
                     names = set()
                     for row in connection.execute("SELECT * FROM collections"):
@@ -167,6 +169,21 @@ class Database:
                     for row in connection.execute("SELECT * FROM project_collections"):
                         if row["project_id"] not in project_ids or row["collection_id"] not in collection_ids:
                             raise ValueError("В резервной копии нарушены связи подборок.")
+                if revision == REVISION:
+                    for row in connection.execute("SELECT * FROM projects"):
+                        state = json.loads(row["file_history_state"]) if row["file_history_state"] else None
+                        if state is not None and (not isinstance(state, dict) or len(state) > 2 or any(key not in {"daw", "demo"} or not isinstance(value, dict) or set(value) != {"path", "mtime", "size"} or not isinstance(value["path"], str) or not isinstance(value["mtime"], (int, float)) or not 0 <= value["mtime"] < float("inf") or not isinstance(value["size"], int) or value["size"] < 0 for key, value in state.items())):
+                            raise ValueError("В резервной копии некорректная история файлов.")
+                    for row in connection.execute("SELECT * FROM activity_events"):
+                        if row["project_id"] not in project_ids or row["kind"] not in EVENT_KINDS or not isinstance(row["summary"], str) or not row["summary"].strip() or len(row["summary"]) > 5000:
+                            raise ValueError("В резервной копии некорректные события.")
+                        if not isinstance(json.loads(row["details"]), dict) or len(row["details"]) > 50000:
+                            raise ValueError("В резервной копии некорректные подробности событий.")
+                        duration = row["duration_minutes"]
+                        if duration is not None and (row["kind"] != "manual" or not isinstance(duration, int) or not 1 <= duration <= 1440):
+                            raise ValueError("В резервной копии некорректная длительность работы.")
+                        for stamp in ("occurred_at", "recorded_at"):
+                            datetime.fromisoformat(row[stamp])
                 return revision
         except json.JSONDecodeError as error:
             raise ValueError("В резервной копии некорректные теги.") from error

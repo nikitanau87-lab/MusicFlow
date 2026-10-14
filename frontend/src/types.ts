@@ -21,3 +21,4 @@ export type Bridge = {
 declare global {
   interface Window { pywebview?: { token: string; api: Bridge }; musicflowUnsaved?: boolean; }
 }
+export type ActivityEvent = {id:number;kind:string;summary:string;occurred_at:string;recorded_at:string;duration_minutes:number|null;details:{changes?:Record<string,{before:unknown;after:unknown}>;[key:string]:unknown}};
