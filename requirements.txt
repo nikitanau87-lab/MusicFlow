@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+SQLAlchemy
+alembic
+pywebview
+pyobjc-framework-Cocoa
+pyobjc-framework-WebKit
+pyobjc-framework-Quartz
+pyobjc-framework-Security
